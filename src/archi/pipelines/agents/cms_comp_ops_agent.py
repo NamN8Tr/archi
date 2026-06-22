@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from typing import Any, Callable, Dict, List
 
 from src.utils.logging import get_logger
@@ -26,14 +25,6 @@ logger = get_logger(__name__)
 
 class CMSCompOpsAgent(BaseReActAgent):
     """Agent designed for CMS CompOps operations."""
-
-    BUILTIN_MCP_SERVERS = {
-        # "submit_status": {
-        #     "transport": "stdio",
-        #     "command": sys.executable,
-        #     "args": ["-m", "src.archi.mcp_servers.submit_status"],
-        # },
-    }
 
     def __init__(
         self,

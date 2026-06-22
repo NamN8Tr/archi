@@ -1134,18 +1134,10 @@ class BaseReActAgent:
         static_names = [name for name in selected if name != "mcp"]
         return self._select_tools_from_registry(static_names)
 
-    def get_mcp_servers_config(self) -> Dict[str, Any]:
-        """
-        Return MCP server config for this agent: any BUILTIN_MCP_SERVERS defined
-        by a concrete agent subclass, merged with servers from the deployment config.
-        """
-        builtin_servers = getattr(self, "BUILTIN_MCP_SERVERS", {})
-        return {**builtin_servers, **get_mcp_servers_config()}
-
     def _build_mcp_tools(self) -> List[Callable]:
         """Retrieve MCP tools from servers defined in the config and keep those server connections alive"""
         try:
-            mcp_servers = self.get_mcp_servers_config()
+            mcp_servers = get_mcp_servers_config()
             if not mcp_servers:
                 logger.info("No MCP servers configured for %s.", self.__class__.__name__)
                 return None
