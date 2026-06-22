@@ -12,13 +12,10 @@ from src.archi.pipelines.agents.utils.skill_utils import load_skill
 
 logger = get_logger(__name__)
 
-async def initialize_mcp_client(servers: dict | None = None) -> Tuple[Optional[MultiServerMCPClient], List[BaseTool], str]:
+async def initialize_mcp_client() -> Tuple[Optional[MultiServerMCPClient], List[BaseTool], str]:
     """
     Initializes the MCP client and fetches tool definitions.
 
-    Args:
-        servers: If provided, use these server definitions directly instead of
-            reading from the deployment config.
     Returns:
         client: The active client instance (must be kept alive by the caller).
         tools: The list of LangChain-compatible tools.
