@@ -62,7 +62,8 @@ class PostgresServiceFactory:
         self._config_service: Optional[ConfigService] = None
         self._conversation_service: Optional[ConversationService] = None
         self._document_selection_service: Optional[DocumentSelectionService] = None
-    
+        self._mcp_server_registry = None
+
     @classmethod
     def from_config(
         cls,
@@ -216,7 +217,17 @@ class PostgresServiceFactory:
                 connection_pool=self.connection_pool,
             )
         return self._document_selection_service
-    
+
+    @property
+    def mcp_server_registry(self):
+        """Get McpRuntimeServerRegistry (lazy-initialized) for runtime-added MCP servers."""
+        if self._mcp_server_registry is None:
+            from src.utils.mcp_server_registry import McpRuntimeServerRegistry
+            self._mcp_server_registry = McpRuntimeServerRegistry(
+                connection_pool=self.connection_pool,
+            )
+        return self._mcp_server_registry
+
     def close(self) -> None:
         """Close connection pool and cleanup resources."""
         if self._pool:
@@ -228,7 +239,8 @@ class PostgresServiceFactory:
         self._config_service = None
         self._conversation_service = None
         self._document_selection_service = None
-    
+        self._mcp_server_registry = None
+
     def __enter__(self) -> 'PostgresServiceFactory':
         """Context manager entry."""
         return self

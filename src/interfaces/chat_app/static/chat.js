@@ -30,6 +30,7 @@ const CONFIG = {
     AB_PREFERENCE: '/api/ab/preference',
     AB_PENDING: '/api/ab/pending',
     AB_POOL: '/api/ab/pool',
+    MCP_SERVERS: '/api/mcp/servers',
     AB_DECISION: '/api/ab/decision',
     AB_POOL_SET: '/api/ab/pool/set',
     AB_POOL_DISABLE: '/api/ab/pool/disable',
@@ -576,6 +577,30 @@ const API = {
       }),
     });
   },
+  async getMcpServers() {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.MCP_SERVERS}?client_id=${encodeURIComponent(this.clientId)}`);
+  },
+
+  async addMcpServer(payload) {
+    return this.fetchJson(CONFIG.ENDPOINTS.MCP_SERVERS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
+  async deleteMcpServer(name) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.MCP_SERVERS}/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  async reconnectMcpServer(name) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.MCP_SERVERS}/${encodeURIComponent(name)}/reconnect`, {
+      method: 'POST',
+    });
+  },
+
 };
 
 // =============================================================================
@@ -1034,6 +1059,39 @@ const UI = {
     document.querySelectorAll('.settings-nav-item').forEach(btn => {
       btn.addEventListener('click', (e) => this.switchSettingsSection(e.target.closest('.settings-nav-item')));
     });
+    // MCP servers bindings (Settings → MCP servers, also opened by /mcp)
+    document.querySelector('.mcp-add-btn')?.addEventListener('click', () => Chat.showMcpAddView());
+    document.querySelector('.mcp-add-back')?.addEventListener('click', () => Chat.showMcpListView());
+    document.querySelector('.mcp-add-connect')?.addEventListener('click', () => Chat.addMcpServerFromPanel());
+    // One delegated handler over both server sections (deployment + user).
+    document.getElementById('mcp-list-view')?.addEventListener('click', (e) => {
+      const removeBtn = e.target.closest('.mcp-remove');
+      if (removeBtn?.dataset.name) { Chat.removeMcpServerFromPanel(removeBtn.dataset.name); return; }
+      const statusBtn = e.target.closest('.mcp-status-btn');
+      if (statusBtn) {
+        // Green/connected pill is inert; only the red one reconnects.
+        if (statusBtn.dataset.connected !== 'true') Chat.reconnectMcpServerFromPanel(statusBtn.dataset.name);
+        return;
+      }
+      // A click anywhere else on the card opens its detail window.
+      const card = e.target.closest('.mcp-card');
+      if (card?.dataset.name) Chat.showMcpDetailView(card.dataset.name);
+    });
+    // Keyboard activation for the card (role="button").
+    document.getElementById('mcp-list-view')?.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (e.target.closest('.mcp-status-btn, .mcp-remove')) return;
+      const card = e.target.closest('.mcp-card');
+      if (card?.dataset.name) { e.preventDefault(); Chat.showMcpDetailView(card.dataset.name); }
+    });
+    // Detail window: back arrow, reconnect (red pill), and remove.
+    document.getElementById('mcp-detail-view')?.addEventListener('click', (e) => {
+      if (e.target.closest('.mcp-detail-back')) { Chat.showMcpListView(); return; }
+      const removeBtn = e.target.closest('.mcp-remove');
+      if (removeBtn?.dataset.name) { Chat.removeMcpServerFromPanel(removeBtn.dataset.name); return; }
+      const statusBtn = e.target.closest('.mcp-status-btn');
+      if (statusBtn && statusBtn.dataset.connected !== 'true') Chat.reconnectMcpServerFromPanel(statusBtn.dataset.name);
+    });
   },
 
   openSettings() {
@@ -1070,6 +1128,14 @@ const UI = {
     if (targetSection) {
       targetSection.classList.add('active');
       targetSection.hidden = false;
+    }
+
+    // Load MCP servers fresh whenever the section is shown (reached via the
+    // gear menu or the /mcp command); always land on the list, not a stale add
+    // view. These methods live on Chat, not UI (this === UI here).
+    if (sectionId === 'mcp') {
+      Chat.showMcpListView();
+      Chat.loadMcpServers();
     }
   },
 
@@ -4964,6 +5030,254 @@ const Chat = {
       localStorage.setItem(CONFIG.STORAGE_KEYS.TRACE_VERBOSE_MODE, mode);
     }
   },
+  // ---- MCP servers panel (the /mcp command) ----
+
+  // Open Settings on the MCP servers section (also the /mcp command target).
+  // openSettings / switchSettingsSection live on UI, not Chat; the latter loads
+  // the list + resets to list view for 'mcp'.
+  openMcpSettings() {
+    UI.openSettings();
+    const nav = document.querySelector('.settings-nav-item[data-section="mcp"]');
+    if (nav) UI.switchSettingsSection(nav);
+  },
+
+  // Three stacked views inside the MCP section: the server list, the add form,
+  // and a per-server detail window. Only one is shown at a time. The "+ Add
+  // server" button lives inside the list view, so it hides with it.
+  _showMcpView(which) {
+    ['list', 'add', 'detail'].forEach(k => {
+      const el = document.getElementById(`mcp-${k}-view`);
+      if (el) el.hidden = (k !== which);
+    });
+  },
+
+  showMcpListView() {
+    this._showMcpView('list');
+  },
+
+  showMcpAddView() {
+    this._showMcpView('add');
+    const status = document.querySelector('#mcp-status-line');
+    if (status) status.textContent = '';
+    document.querySelector('#mcp-name')?.focus();
+  },
+
+  showMcpDetailView(name) {
+    const s = this._mcpServers?.[name];
+    if (!s) return;
+    const view = document.getElementById('mcp-detail-view');
+    if (view) view.dataset.name = name;
+    this._renderMcpDetail(s);
+    this._showMcpView('detail');
+  },
+
+  // The status pill doubles as the reconnect control: green + static when
+  // connected, red + clickable ("Disconnected") otherwise. data-connected
+  // gates the click so a connected server can't be needlessly re-probed.
+  _mcpStatusBtnHtml(s) {
+    const nameAttr = Utils.escapeAttr(s.name);
+    if (s.status === 'connected') {
+      const n = (s.tools || []).length;
+      return `<button class="mcp-status-btn mcp-status-ok" type="button" data-name="${nameAttr}" data-connected="true" title="${n} tool${n === 1 ? '' : 's'} available">Connected</button>`;
+    }
+    const title = s.status === 'error'
+      ? Utils.escapeAttr(s.error || 'Connection failed — click to retry')
+      : 'Not connected yet — click to connect';
+    return `<button class="mcp-status-btn mcp-status-off" type="button" data-name="${nameAttr}" data-connected="false" title="${title}">Disconnected</button>`;
+  },
+
+  // Right-hand card controls: the status pill, a Remove button (user servers
+  // only), and a chevron signalling the card opens a detail window.
+  _mcpControlsHtml(s) {
+    const remove = s.source === 'runtime'
+      ? `<button class="mcp-remove" data-name="${Utils.escapeAttr(s.name)}" type="button">Remove</button>`
+      : '';
+    const chevron = '<svg class="mcp-card-open" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>';
+    return `${this._mcpStatusBtnHtml(s)}${remove}${chevron}`;
+  },
+
+  // Tool names shown in the detail window, or why there are none yet.
+  _mcpToolsBody(s) {
+    if (s.status === 'connected') {
+      const tools = s.tools || [];
+      return tools.length
+        ? `<div class="mcp-tools-chips">${tools.map(t => `<span class="mcp-tool-chip">${Utils.escapeHtml(t)}</span>`).join('')}</div>`
+        : '<div class="mcp-tools-empty">Connected, but this server exposes no tools.</div>';
+    }
+    if (s.status === 'error') {
+      return `<div class="mcp-tools-empty">Not connected: ${Utils.escapeHtml(s.error || 'connection failed')}. Reconnect to load its tools.</div>`;
+    }
+    return '<div class="mcp-tools-empty">Not connected yet — connects on the next chat message, or click the status to connect now.</div>';
+  },
+
+  // A compact list row: name + source badge + controls. The command/URL and
+  // tools live in the detail window (opened by clicking the card), not here.
+  _mcpCardHtml(s) {
+    const nameAttr = Utils.escapeAttr(s.name);
+    const isUser = s.source === 'runtime';
+    const sourceBadge = isUser
+      ? '<span class="mcp-source-badge mcp-source-user" title="Added by you for this session">You</span>'
+      : '<span class="mcp-source-badge mcp-source-deployment" title="Provided by the deployment config (read-only)">Deployment</span>';
+    return `
+          <div class="mcp-card" data-name="${nameAttr}" data-source="${isUser ? 'runtime' : 'config'}" role="button" tabindex="0" aria-label="Open ${nameAttr} details">
+            <div class="mcp-card-head">
+              <div class="mcp-card-heading">
+                <span class="mcp-card-name">${Utils.escapeHtml(s.name)}</span>
+                ${sourceBadge}
+              </div>
+              <div class="mcp-card-controls">
+                ${this._mcpControlsHtml(s)}
+              </div>
+            </div>
+          </div>`;
+  },
+
+  async loadMcpServers() {
+    const depList = document.querySelector('.mcp-list-deployment');
+    const userList = document.querySelector('.mcp-list-user');
+    if (!depList || !userList) return;
+    const render = (servers, emptyMsg) => servers.length
+      ? servers.map(s => this._mcpCardHtml(s)).join('')
+      : `<div class="mcp-empty">${emptyMsg}</div>`;
+    try {
+      const data = await API.getMcpServers();
+      const servers = data?.servers || [];
+      // Keep a name→server lookup so the detail window and reconnect can read
+      // the current config/tools without another fetch.
+      this._mcpServers = {};
+      servers.forEach(s => { this._mcpServers[s.name] = s; });
+      const deployment = servers.filter(s => s.source !== 'runtime');
+      const user = servers.filter(s => s.source === 'runtime');
+      depList.innerHTML = render(deployment, 'No deployment servers configured.');
+      userList.innerHTML = render(user, 'No user servers yet. Use “+ Add server” to connect one.');
+    } catch (e) {
+      depList.innerHTML = '<div class="mcp-empty">Could not load MCP servers.</div>';
+      userList.innerHTML = '';
+    }
+  },
+
+  // The server's config + full tool list, shown in its own view with a back
+  // arrow (the list row only carries the name + status).
+  _renderMcpDetail(s) {
+    const body = document.querySelector('.mcp-detail-body');
+    if (!body) return;
+    const isUser = s.source === 'runtime';
+    const sourceBadge = isUser
+      ? '<span class="mcp-source-badge mcp-source-user">You</span>'
+      : '<span class="mcp-source-badge mcp-source-deployment">Deployment</span>';
+    const rows = [['Source', isUser ? 'User — added by you for this session' : 'Deployment — read-only']];
+    if (s.transport) rows.push(['Transport', s.transport]);
+    if (s.url) rows.push(['URL', s.url]);
+    if (s.command) rows.push(['Command', s.command]);
+    if (s.skill) rows.push(['Skill', s.skill]);
+    if (Array.isArray(s.header_keys) && s.header_keys.length) rows.push(['Header keys', s.header_keys.join(', ')]);
+    const configHtml = rows.map(([k, v]) =>
+      `<div class="mcp-detail-row"><span class="mcp-detail-key">${Utils.escapeHtml(k)}</span><span class="mcp-detail-val">${Utils.escapeHtml(v)}</span></div>`).join('');
+    const removeHtml = isUser
+      ? `<div class="mcp-detail-actions"><button class="mcp-remove" data-name="${Utils.escapeAttr(s.name)}" type="button">Remove server</button></div>`
+      : '';
+    body.innerHTML = `
+          <div class="mcp-detail-head">
+            <span class="mcp-card-name">${Utils.escapeHtml(s.name)}</span>
+            ${sourceBadge}
+            ${this._mcpStatusBtnHtml(s)}
+          </div>
+          <div class="mcp-detail-section-title">Configuration</div>
+          <div class="mcp-detail-config">${configHtml}</div>
+          <div class="mcp-detail-section-title">Tools</div>
+          <div class="mcp-detail-tools">${this._mcpToolsBody(s)}</div>
+          ${removeHtml}`;
+  },
+
+  // Re-render the pill wherever it currently shows (list card and/or the open
+  // detail window) from the stored server state.
+  _refreshMcpServer(name) {
+    const s = this._mcpServers?.[name];
+    if (!s) return;
+    const card = document.querySelector(`.mcp-card[data-name="${CSS.escape(name)}"]`);
+    const controls = card?.querySelector('.mcp-card-controls');
+    if (controls) controls.innerHTML = this._mcpControlsHtml(s);
+    const detailView = document.getElementById('mcp-detail-view');
+    if (detailView && !detailView.hidden && detailView.dataset.name === name) {
+      this._renderMcpDetail(s);
+    }
+  },
+
+  async reconnectMcpServerFromPanel(name) {
+    // The pill can live on the (possibly hidden) list card or in the open
+    // detail window; relabel whichever is actually showing.
+    const detailView = document.getElementById('mcp-detail-view');
+    const scope = (detailView && !detailView.hidden && detailView.dataset.name === name)
+      ? detailView
+      : document.querySelector(`.mcp-card[data-name="${CSS.escape(name)}"]`);
+    const btn = scope?.querySelector('.mcp-status-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+    try {
+      const data = await API.reconnectMcpServer(name);
+      if (this._mcpServers?.[name]) {
+        this._mcpServers[name] = {
+          ...this._mcpServers[name],
+          status: data.status,
+          tools: data.tools,
+          error: data.error,
+        };
+      }
+    } catch (e) {
+      // A probe failure comes back as 200 {status:error}; a throw means the
+      // request itself failed — leave the stored state so re-render restores
+      // a clickable pill for another try.
+    }
+    // Pill colour/title (green Connected vs red Disconnected) is the feedback.
+    this._refreshMcpServer(name);
+  },
+
+  async addMcpServerFromPanel() {
+    const name = document.querySelector('#mcp-name')?.value.trim();
+    const url = document.querySelector('#mcp-url')?.value.trim();
+    const type = document.querySelector('#mcp-type')?.value || 'http';
+    const headersRaw = document.querySelector('#mcp-headers')?.value.trim();
+    const status = document.querySelector('#mcp-status-line');
+    const setStatus = (msg) => { if (status) status.textContent = msg; };
+    let headers;
+    if (headersRaw) {
+      try {
+        headers = JSON.parse(headersRaw);
+      } catch (e) {
+        setStatus('Headers must be a JSON object, e.g. {"Authorization": "Bearer …"}');
+        return;
+      }
+    }
+    setStatus('Connecting…');
+    try {
+      // A stored server (even one whose probe failed) returns 2xx; the list row
+      // then shows its connected/error badge. Only a rejected add (validation,
+      // 409) throws — those stay on the add view so the user can fix the input.
+      await API.addMcpServer({ name, url, type, ...(headers ? { headers } : {}) });
+      ['#mcp-name', '#mcp-url', '#mcp-headers'].forEach(sel => {
+        const el = document.querySelector(sel);
+        if (el) el.value = '';
+      });
+      this.showMcpListView();
+      await this.loadMcpServers();
+    } catch (e) {
+      setStatus(e.message || 'Could not add server.');
+    }
+  },
+
+  async removeMcpServerFromPanel(name) {
+    try {
+      await API.deleteMcpServer(name);
+      if (this._mcpServers) delete this._mcpServers[name];
+      // Remove may have been triggered from the detail window; return to the list.
+      this.showMcpListView();
+      await this.loadMcpServers();
+    } catch (e) {
+      const list = document.querySelector('.mcp-list-user') || document.querySelector('.mcp-list');
+      if (list) list.insertAdjacentHTML('afterbegin',
+        `<div class="mcp-status-line">${Utils.escapeHtml(e.message || `Could not remove '${name}'.`)}</div>`);
+    }
+  },
+
 };
 
 window.__ARCHI_PLAYWRIGHT__ = {

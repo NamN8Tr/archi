@@ -21,8 +21,7 @@ from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
 from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
-from src.archi.pipelines.agents.tools import initialize_mcp_client
-from src.utils.config_access import get_mcp_servers_config
+from src.archi.pipelines.agents.tools import initialize_mcp_client, get_effective_mcp_servers
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1140,10 +1139,25 @@ class BaseReActAgent:
         static_names = [name for name in selected if name != "mcp"]
         return self._select_tools_from_registry(static_names)
 
+    def reset_mcp_tools(self) -> None:
+        """Drop cached MCP tools so the next refresh_agent() rebuilds them.
+
+        Called when the runtime MCP server set changes (the /mcp chat command).
+        Sessions are opened per tool call on the shared background loop, so
+        there is no long-lived connection to close — dropping the references
+        is enough; the next chat message reconnects with the new server set.
+        """
+        self._mcp_tools = None
+        self.mcp_client = None
+        self._mcp_skills_text = ""
+
     def _build_mcp_tools(self) -> List[Callable]:
         """Retrieve MCP tools from servers defined in the config and keep those server connections alive"""
         try:
-            mcp_servers = get_mcp_servers_config()
+            # Config-defined servers merged with runtime-added ones (the /mcp
+            # chat command); builtin agent servers keep lowest precedence.
+            builtin_servers = getattr(self, "BUILTIN_MCP_SERVERS", {})
+            mcp_servers = {**builtin_servers, **get_effective_mcp_servers()}
             if not mcp_servers:
                 logger.info("No MCP servers configured for %s.", self.__class__.__name__)
                 return None

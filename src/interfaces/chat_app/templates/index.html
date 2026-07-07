@@ -208,6 +208,15 @@
               </svg>
               <span>Display</span>
             </button>
+            <button class="settings-nav-item" data-section="mcp" aria-selected="false">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="2" width="20" height="8" rx="2"></rect>
+                <rect x="2" y="14" width="20" height="8" rx="2"></rect>
+                <line x1="6" y1="6" x2="6.01" y2="6"></line>
+                <line x1="6" y1="18" x2="6.01" y2="18"></line>
+              </svg>
+              <span>MCP servers</span>
+            </button>
           </nav>
           
           <!-- Settings Body -->
@@ -303,6 +312,69 @@
                   </label>
                 </div>
                 <p class="settings-description">Switch between light and dark themes.</p>
+              </div>
+            </section>
+
+            <section class="settings-section" id="settings-mcp" aria-labelledby="mcp-heading" hidden>
+              <h4 class="settings-section-title" id="mcp-heading">MCP servers</h4>
+              <p class="settings-description">Tool servers this chat can use. Click a server to see the tools it exposes; click a red status to reconnect.</p>
+
+              <!-- List view -->
+              <div id="mcp-list-view">
+                <div class="mcp-subsection">
+                  <div class="mcp-subsection-header">
+                    <div class="mcp-subsection-heading">
+                      <h5 class="mcp-subsection-title">Deployment servers</h5>
+                      <p class="mcp-subsection-desc">Configured by this ARCHI deployment. These are read-only.</p>
+                    </div>
+                  </div>
+                  <div class="mcp-list mcp-list-deployment"></div>
+                </div>
+
+                <div class="mcp-subsection">
+                  <div class="mcp-subsection-header">
+                    <div class="mcp-subsection-heading">
+                      <h5 class="mcp-subsection-title">User servers</h5>
+                      <p class="mcp-subsection-desc">Servers you connect for this chat/session.</p>
+                    </div>
+                    <button class="mcp-add-btn" type="button" aria-label="Add MCP server">+ Add server</button>
+                  </div>
+                  <div class="mcp-list mcp-list-user"></div>
+                </div>
+              </div>
+
+              <!-- Detail view (reached by clicking a server): config + tools -->
+              <div id="mcp-detail-view" hidden>
+                <button class="mcp-detail-back" type="button" aria-label="Back to server list">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <line x1="19" y1="12" x2="5" y2="12"></line>
+                    <polyline points="12 19 5 12 12 5"></polyline>
+                  </svg>
+                  <span>Back</span>
+                </button>
+                <div class="mcp-detail-body"></div>
+              </div>
+
+              <!-- Add view (reached from the + button) -->
+              <div id="mcp-add-view" hidden>
+                <div class="mcp-add-form">
+                  <label class="settings-field-label" for="mcp-name">Name</label>
+                  <input id="mcp-name" type="text" placeholder="e.g. my-tools" autocomplete="off" />
+                  <label class="settings-field-label" for="mcp-url">URL</label>
+                  <input id="mcp-url" type="text" placeholder="http(s)://host:port/mcp" autocomplete="off" />
+                  <label class="settings-field-label" for="mcp-type">Transport</label>
+                  <select id="mcp-type" aria-label="MCP transport">
+                    <option value="http">HTTP (streamable)</option>
+                    <option value="sse">SSE</option>
+                  </select>
+                  <label class="settings-field-label" for="mcp-headers">Headers (optional)</label>
+                  <textarea id="mcp-headers" rows="2" placeholder='JSON, e.g. {"Authorization": "Bearer …"}'></textarea>
+                  <div class="mcp-status-line" id="mcp-status-line" role="alert"></div>
+                  <div class="mcp-add-actions">
+                    <button class="mcp-add-back" type="button">Back</button>
+                    <button class="mcp-add-connect" type="button">Connect</button>
+                  </div>
+                </div>
               </div>
             </section>
           </div>

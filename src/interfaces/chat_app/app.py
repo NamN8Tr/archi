@@ -47,7 +47,7 @@ from src.data_manager.data_viewer_service import DataViewerService
 from src.data_manager.vectorstore.manager import VectorStoreManager
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
-from src.utils.config_access import get_full_config, get_services_config, get_global_config, get_dynamic_config
+from src.utils.config_access import get_full_config, get_services_config, get_global_config, get_dynamic_config, get_mcp_servers_config
 from src.utils.config_service import ConfigService, StaticConfig
 from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
@@ -2610,6 +2610,13 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/admin/database/tables', 'list_database_tables', self.require_perm(Permission.Admin.DATABASE)(self.list_database_tables), methods=["GET"])
         self.add_endpoint('/api/admin/database/query', 'run_database_query', self.require_perm(Permission.Admin.DATABASE)(self.run_database_query), methods=["POST"])
 
+        # MCP server management endpoints (the /mcp chat command)
+        logger.info("Adding MCP server management endpoints")
+        self.add_endpoint('/api/mcp/servers', 'list_mcp_servers', self.require_auth(self.list_mcp_servers), methods=["GET"])
+        self.add_endpoint('/api/mcp/servers', 'add_mcp_server', self.require_auth(self.add_mcp_server), methods=["POST"])
+        self.add_endpoint('/api/mcp/servers/<name>', 'delete_mcp_server', self.require_auth(self.delete_mcp_server), methods=["DELETE"])
+        self.add_endpoint('/api/mcp/servers/<name>/reconnect', 'reconnect_mcp_server', self.require_auth(self.reconnect_mcp_server), methods=["POST"])
+
         # Service status board endpoints (registered via Blueprint)
         logger.info("Adding service status board endpoints")
         register_service_alerts(
@@ -2932,6 +2939,172 @@ class FlaskAppWrapper(object):
                 return f(*args, **kwargs)
             return decorated_function
         return decorator
+
+    def _mcp_registry(self):
+        """McpRuntimeServerRegistry on the pooled factory when available.
+
+        Reuse the process-wide connection pool instead of
+        opening a fresh TCP connection per /api/mcp request.
+        """
+        try:
+            from src.utils.postgres_service_factory import PostgresServiceFactory
+            factory = PostgresServiceFactory.get_instance()
+            if factory is not None:
+                return factory.mcp_server_registry
+        except Exception as exc:
+            logger.debug("Pooled MCP registry unavailable, using direct connections: %s", exc)
+        from src.utils.mcp_server_registry import McpRuntimeServerRegistry
+        return McpRuntimeServerRegistry(pg_config=self.pg_config)
+
+    def _reset_agent_mcp_tools(self) -> None:
+        """Drop the live agent's cached MCP tools; the next message reconnects
+        with the current (config + runtime) server set."""
+        pipeline = getattr(getattr(self.chat, "archi", None), "pipeline", None)
+        if pipeline is not None and hasattr(pipeline, "reset_mcp_tools"):
+            pipeline.reset_mcp_tools()
+
+    @staticmethod
+    def _describe_mcp_server(name, cfg, source, status):
+        """Public, redacted view of one MCP server entry.
+
+        Header VALUES never leave the server (they may carry auth tokens);
+        only the key names are listed so the UI can show what is configured.
+        """
+        entry = {
+            "name": name,
+            "source": source,
+            "transport": cfg.get("transport"),
+        }
+        if cfg.get("url"):
+            entry["url"] = cfg["url"]
+        if cfg.get("command"):
+            entry["command"] = " ".join([str(cfg["command"]), *map(str, cfg.get("args") or [])])
+        if cfg.get("skill"):
+            entry["skill"] = cfg["skill"]
+        if isinstance(cfg.get("headers"), dict):
+            entry["header_keys"] = sorted(cfg["headers"].keys())
+        active = status.get("active") or {}
+        failed = status.get("failed") or {}
+        if name in failed:
+            entry["status"] = "error"
+            entry["error"] = str(failed[name])
+        elif name in active:
+            entry["status"] = "connected"
+            entry["tools"] = list(active[name])
+        else:
+            entry["status"] = "pending"
+        return entry
+
+    def list_mcp_servers(self):
+        """GET /api/mcp/servers — config + runtime servers with last-build status."""
+        from src.archi.pipelines.agents.tools.mcp import last_build_status
+        config_servers = get_mcp_servers_config() or {}
+        servers = [
+            self._describe_mcp_server(name, cfg, "config", last_build_status)
+            for name, cfg in config_servers.items()
+        ]
+        try:
+            runtime = self._mcp_registry().list()
+        except Exception as exc:
+            logger.error("Failed to list runtime MCP servers: %s", exc)
+            return jsonify({"error": "runtime MCP registry unavailable"}), 500
+        servers.extend(
+            self._describe_mcp_server(name, server.config, "runtime", last_build_status)
+            for name, server in runtime.items()
+            if name not in config_servers
+        )
+        return jsonify({"servers": servers, "built_at": last_build_status.get("built_at")})
+
+    def add_mcp_server(self):
+        """POST /api/mcp/servers — connect a new HTTP MCP server at runtime.
+
+        Body is a Claude-style entry plus `name`:
+        {"name": "...", "type": "http"|"sse", "url": "...", "headers": {...}, "skill": "..."}
+        """
+        from src.utils.mcp_server_registry import McpServerValidationError
+        data = request.get_json(silent=True) or {}
+        name = str(data.pop("name", "") or "").strip()
+        if not name:
+            return jsonify({"error": "Server name is required"}), 400
+        if name in (get_mcp_servers_config() or {}):
+            return jsonify({
+                "error": f"'{name}' is defined in the deployment config and cannot be replaced from the chat UI"
+            }), 409
+        data.pop("client_id", None)
+        try:
+            # Auth identity lives under session['user'] (set at login); anonymous
+            # sessions have no entry and record NULL.
+            cfg = self._mcp_registry().add(
+                name, data, added_by=(session.get("user") or {}).get("email"),
+            )
+        except McpServerValidationError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            logger.error("Failed to store MCP server '%s': %s", name, exc)
+            return jsonify({"error": "failed to store server"}), 500
+        self._reset_agent_mcp_tools()
+
+        # One-off probe for immediate feedback; the agent reconnects on the
+        # next chat message regardless of this probe's outcome.
+        entry = {"name": name, "source": "runtime",
+                 "transport": cfg.get("transport"), "url": cfg.get("url")}
+        try:
+            from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+            from src.archi.pipelines.agents.tools.mcp import probe_mcp_server
+            tools = AsyncLoopThread.get_instance().run(probe_mcp_server(name, cfg))
+            entry.update({"status": "connected", "tools": tools})
+        except Exception as exc:
+            entry.update({"status": "error", "error": str(exc)})
+        return jsonify({"server": entry}), 201
+
+    def delete_mcp_server(self, name):
+        """DELETE /api/mcp/servers/<name> — disconnect a runtime-added server."""
+        if name in (get_mcp_servers_config() or {}):
+            return jsonify({"error": f"'{name}' is managed by the deployment config"}), 403
+        try:
+            removed = self._mcp_registry().remove(name)
+        except Exception as exc:
+            logger.error("Failed to remove MCP server '%s': %s", name, exc)
+            return jsonify({"error": "failed to remove server"}), 500
+        if not removed:
+            return jsonify({"error": f"no runtime server named '{name}'"}), 404
+        from src.archi.pipelines.agents.tools.mcp import last_build_status
+        last_build_status["active"].pop(name, None)
+        last_build_status["failed"].pop(name, None)
+        self._reset_agent_mcp_tools()
+        return jsonify({"status": "removed", "name": name})
+
+    def reconnect_mcp_server(self, name):
+        """POST /api/mcp/servers/<name>/reconnect — re-probe a single server.
+
+        Works for both config-defined and runtime servers (a config server like
+        remote_diagnostic can be down and later recover). Drops the agent's
+        cached MCP tools so the next chat message reconnects, then probes just
+        this server and returns its fresh status. A probe failure is a normal
+        200 result ({status: error, error: ...}), not an HTTP error — the UI
+        shows it inline on that row.
+        """
+        config_servers = get_mcp_servers_config() or {}
+        if name in config_servers:
+            cfg = config_servers[name]
+        else:
+            try:
+                runtime = self._mcp_registry().list()
+            except Exception as exc:
+                logger.error("Failed to read runtime MCP servers: %s", exc)
+                return jsonify({"error": "runtime MCP registry unavailable"}), 500
+            if name not in runtime:
+                return jsonify({"error": f"no MCP server named '{name}'"}), 404
+            cfg = runtime[name].config
+
+        self._reset_agent_mcp_tools()
+        from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+        from src.archi.pipelines.agents.tools.mcp import probe_mcp_server
+        try:
+            tools = AsyncLoopThread.get_instance().run(probe_mcp_server(name, cfg))
+            return jsonify({"name": name, "status": "connected", "tools": tools})
+        except Exception as exc:
+            return jsonify({"name": name, "status": "error", "error": str(exc)})
 
     def health(self):
         return jsonify({"status": "OK"}), 200

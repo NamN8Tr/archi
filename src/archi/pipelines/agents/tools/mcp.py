@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from datetime import datetime, timezone
 from typing import List, Any, Tuple, Optional
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -12,6 +13,94 @@ from src.utils.mcp_json import expand_env_placeholders
 from src.archi.pipelines.agents.utils.skill_utils import load_skill
 
 logger = get_logger(__name__)
+
+# Last build's per-server outcome, refreshed by every initialize_mcp_client run.
+# The /api/mcp endpoints read this so the UI can show real connect status
+# without opening new MCP sessions. Shape:
+#   {"active": {name: [tool names]}, "failed": {name: error}, "built_at": iso8601}
+last_build_status: dict = {"active": {}, "failed": {}, "built_at": None}
+
+
+def _runtime_mcp_servers() -> dict:
+    """Runtime-added servers (the `/mcp` chat command), or {} when unavailable."""
+    try:
+        from src.utils.postgres_service_factory import PostgresServiceFactory
+        factory = PostgresServiceFactory.get_instance()
+        if factory is None:
+            return {}
+        return factory.mcp_server_registry.configs()
+    except Exception as e:
+        logger.warning(f"Runtime MCP server registry unavailable: {e}")
+        return {}
+
+
+def _describe_mcp_error(exc: BaseException, *, timeout: float | None = None) -> str:
+    """A human-usable one-liner for an MCP connection failure.
+
+    anyio task groups wrap the real failure in nested ExceptionGroups whose
+    str() is 'unhandled errors in a TaskGroup (1 sub-exception)' — useless in
+    the UI. Unwrap to the first leaf exception and name it.
+    """
+    import asyncio
+
+    depth = 0
+    while getattr(exc, "exceptions", None) and depth < 10:
+        exc = exc.exceptions[0]
+        depth += 1
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and timeout is not None:
+        return f"timed out after {timeout:.0f}s"
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+async def probe_mcp_server(name: str, server_cfg: dict, timeout: float = 10.0) -> List[str]:
+    """Open a one-off session to a single server and return its tool names.
+
+    Used by the /api/mcp endpoints for immediate connect feedback when a user
+    adds or reconnects a server from the chat UI. Updates only this server's
+    entry in last_build_status; raises on failure (caller reports str(exc)).
+    """
+    import asyncio
+
+    _patch_langchain_mcp_dict_schema_recursion()
+    _archi_only_fields = {
+        "env_from_secrets", "host_file_mounts", "build_context", "image", "path", "skill",
+    }
+    cfg = {k: v for k, v in server_cfg.items() if k not in _archi_only_fields}
+    cfg = expand_env_placeholders(cfg, os.environ)
+    if cfg.get("transport") == "stdio":
+        cfg["env"] = {**os.environ, **(cfg.get("env") or {})}
+    else:
+        cfg.pop("env", None)
+    client = MultiServerMCPClient({name: cfg})
+    try:
+        tools = await asyncio.wait_for(client.get_tools(server_name=name), timeout)
+    except Exception as e:
+        message = _describe_mcp_error(e, timeout=timeout)
+        last_build_status["failed"][name] = message
+        last_build_status["active"].pop(name, None)
+        raise RuntimeError(message) from e
+    tool_names = [tool.name for tool in tools]
+    last_build_status["active"][name] = tool_names
+    last_build_status["failed"].pop(name, None)
+    return tool_names
+
+
+def get_effective_mcp_servers() -> dict:
+    """Config-defined MCP servers merged with runtime-added ones.
+
+    Config entries win on name collision — a chat user must not be able to
+    shadow an operator-managed server.
+    """
+    config_servers = get_mcp_servers_config() or {}
+    merged = dict(_runtime_mcp_servers())
+    for name, cfg in config_servers.items():
+        if name in merged:
+            logger.warning(
+                f"Runtime MCP server '{name}' shadowed by config-defined server; using config"
+            )
+        merged[name] = cfg
+    return merged
 
 
 def _patch_langchain_mcp_dict_schema_recursion() -> None:
@@ -63,7 +152,7 @@ async def initialize_mcp_client(servers: dict | None = None) -> Tuple[Optional[M
 
     _patch_langchain_mcp_dict_schema_recursion()
 
-    mcp_servers = servers if servers is not None else get_mcp_servers_config()
+    mcp_servers = servers if servers is not None else get_effective_mcp_servers()
 
     # Strip archi-only fields that langchain-mcp-adapters doesn't understand.
     # These are consumed by the compose template (sidecars), the legacy stdio
@@ -112,6 +201,7 @@ async def initialize_mcp_client(servers: dict | None = None) -> Tuple[Optional[M
     client = MultiServerMCPClient(client_configs)
 
     all_tools: List[BaseTool] = []
+    tools_by_server: dict[str, list[str]] = {}
 
     for name in client_configs.keys():
         try:
@@ -121,12 +211,19 @@ async def initialize_mcp_client(servers: dict | None = None) -> Tuple[Optional[M
                 tool.handle_tool_error = True
                 logger.info(f"Loaded tool from MCP server '{name}': {tool.name} - {tool.description}")
             all_tools.extend(tools)
+            tools_by_server[name] = [tool.name for tool in tools]
         except Exception as e:
-            logger.error(f"Failed to fetch tools from MCP server '{name}': {e}")
-            failed_servers[name] = str(e)
+            message = _describe_mcp_error(e)
+            logger.error(f"Failed to fetch tools from MCP server '{name}': {message}")
+            failed_servers[name] = message
 
     logger.info(f"Active MCP servers: {[n for n in client_configs if n not in failed_servers]}")
     logger.warning(f"Failed MCP servers: {list(failed_servers.keys())}")
+
+    # Publish the outcome for the /api/mcp endpoints (read-only UI status).
+    last_build_status["active"] = tools_by_server
+    last_build_status["failed"] = dict(failed_servers)
+    last_build_status["built_at"] = datetime.now(timezone.utc).isoformat()
 
     # Build a single combined skills block keyed by server name — this is appended
     # to the agent's system prompt once, rather than duplicated across every tool.
