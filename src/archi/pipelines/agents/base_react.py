@@ -1359,10 +1359,12 @@ class BaseReActAgent:
     def _context_management_config(self) -> Dict[str, Any]:
         """Read the context_management block, pipeline config first then chat_app."""
         value = None
-        if isinstance(self.pipeline_config, dict):
-            value = self.pipeline_config.get("context_management")
-        if value is None and isinstance(self.config, dict):
-            services_cfg = self.config.get("services", {})
+        pipeline_config = getattr(self, "pipeline_config", None)
+        if isinstance(pipeline_config, dict):
+            value = pipeline_config.get("context_management")
+        config = getattr(self, "config", None)
+        if value is None and isinstance(config, dict):
+            services_cfg = config.get("services", {})
             if isinstance(services_cfg, dict):
                 chat_cfg = services_cfg.get("chat_app", {})
                 if isinstance(chat_cfg, dict):
