@@ -5150,10 +5150,6 @@ class FlaskAppWrapper(object):
         finally:
             self.chat.lock.release()
             logger.info("Released lock file")
-            if self.chat.cursor is not None:
-                self.chat.cursor.close()
-            if self.chat.conn is not None:
-                self.chat.conn.close()
 
     def _toggle_reaction(self, reaction_type):
         """Shared like/dislike toggle: remove if already set, else insert."""
@@ -5273,7 +5269,6 @@ class FlaskAppWrapper(object):
         Returns:
             JSON with conversation metadata and full message history
         """
-        conn = None
         try:
             data = request.json
             conversation_id = data.get('conversation_id')
@@ -5372,10 +5367,6 @@ class FlaskAppWrapper(object):
         except Exception as e:
             logger.error(f"Error in load_conversation: {str(e)}")
             return jsonify({'error': str(e)}), 500
-        finally:
-            # never leak the connection, whichever path returned
-            if conn is not None and not conn.closed:
-                conn.close()
 
     def new_conversation(self):
         """

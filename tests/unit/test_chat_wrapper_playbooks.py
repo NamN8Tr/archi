@@ -29,6 +29,18 @@ def _wrapper() -> ChatWrapper:
     return wrapper
 
 
+def _pooled(wrapper, cursor=None) -> MagicMock:
+    """Point a wrapper at a fake ConnectionPool whose ``get_connection()``
+    context manager yields a connection handing out ``cursor``. Writes go
+    through the pool now, so stubbing psycopg2.connect no longer intercepts
+    them."""
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor or MagicMock()
+    wrapper.pool = MagicMock()
+    wrapper.pool.get_connection.return_value.__enter__.return_value = conn
+    return conn
+
+
 def _context(playbook_name="pb-name", playbook_id=7, conversation_id=55):
     ctx = MagicMock()
     ctx.playbook_name = playbook_name
@@ -62,14 +74,12 @@ def test_insert_conversation_records_playbook_turn_through_real_accessor():
     svc = MagicMock()
     fake_cursor = MagicMock()
     fake_cursor.fetchall.return_value = [(101,), (102,)]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cursor
+    _pooled(wrapper, fake_cursor)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         message_ids = wrapper.insert_conversation(
             1,
             ("User", "run it", "2026-01-01T00:00:00Z"),
@@ -93,14 +103,12 @@ def test_insert_conversation_plain_turn_does_not_touch_the_service():
     svc = MagicMock()
     fake_cursor = MagicMock()
     fake_cursor.fetchall.return_value = [(201,), (202,)]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cursor
+    _pooled(wrapper, fake_cursor)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         wrapper.insert_conversation(
             1,
             ("User", "plain question", "2026-01-01T00:00:00Z"),
@@ -122,14 +130,12 @@ def test_insert_conversation_survives_a_failing_side_table_write():
     svc.record_playbook_turn.side_effect = RuntimeError("side table missing")
     fake_cursor = MagicMock()
     fake_cursor.fetchall.return_value = [(301,), (302,)]
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = fake_cursor
+    _pooled(wrapper, fake_cursor)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         message_ids = wrapper.insert_conversation(
             1,
             ("User", "run it", "2026-01-01T00:00:00Z"),
@@ -181,30 +187,29 @@ def test_convo_history_query_single_roundtrip_when_table_exists():
     cursor.connection.rollback.assert_not_called()
 
 
-def test_load_conversation_closes_connection_on_error():
+def test_load_conversation_releases_connection_on_error():
     """M1's second half: an unexpected error mid-load must not leak the
-    connection — it is closed in a finally, not only on the success path."""
+    connection — the pooled connection is handed back on the error path too,
+    and never hard-closed (that would retire a pool member per request)."""
     from src.interfaces.chat_app.app import FlaskAppWrapper
 
     wrapper = FlaskAppWrapper.__new__(FlaskAppWrapper)
     wrapper.pg_config = {"host": "unused-in-tests"}
     wrapper.chat = MagicMock()
 
-    fake_conn = MagicMock()
-    fake_conn.closed = False
     fake_cursor = MagicMock()
     fake_cursor.execute.side_effect = RuntimeError("boom mid-query")
-    fake_conn.cursor.return_value = fake_cursor
+    fake_conn = _pooled(wrapper, fake_cursor)
 
     app = flask.Flask(__name__)
     with app.test_request_context(
         json={"conversation_id": 1, "client_id": "c1"}
-    ), patch("src.interfaces.chat_app.app.psycopg2") as fake_pg:
-        fake_pg.connect.return_value = fake_conn
+    ), patch("src.interfaces.chat_app.app.psycopg2"):
         _resp, code = wrapper.load_conversation()
 
     assert code == 500
-    fake_conn.close.assert_called_once()
+    wrapper.pool.get_connection.return_value.__exit__.assert_called_once()
+    fake_conn.close.assert_not_called()
 
 
 # ── Unified ledger: auto (model-invoked) Playbook loads ───────────────────────
@@ -225,14 +230,12 @@ def test_insert_tool_calls_records_auto_playbook_invocation_from_artifact():
     svc = MagicMock()
     output = _playbook_output(
         artifact={"kind": "playbook", "playbook_name": "rucio-triage", "playbook_id": 17})
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = MagicMock()
+    _pooled(wrapper)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         wrapper.insert_tool_calls_from_output(9, 101, output)
 
     svc.record_invocation.assert_called_once_with(
@@ -247,14 +250,12 @@ def test_insert_tool_calls_records_auto_playbook_not_found_via_string():
     output = _playbook_output(
         artifact=None, requested="ghost",
         result="No playbook named 'ghost' is in your list. Available now:\n- a: d")
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = MagicMock()
+    _pooled(wrapper)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         wrapper.insert_tool_calls_from_output(9, 101, output)
 
     svc.record_invocation.assert_called_once_with(
@@ -268,14 +269,12 @@ def test_insert_tool_calls_auto_ledger_failure_does_not_break_tool_write():
     svc.record_invocation.side_effect = RuntimeError("ledger missing")
     output = _playbook_output(
         artifact={"kind": "playbook", "playbook_name": "rucio-triage", "playbook_id": 1})
-    fake_conn = MagicMock()
-    fake_conn.cursor.return_value = MagicMock()
+    _pooled(wrapper)
 
-    with patch("src.interfaces.chat_app.app.psycopg2") as fake_pg, patch(
+    with patch("src.interfaces.chat_app.app.psycopg2"), patch(
         "src.utils.postgres_service_factory.PostgresServiceFactory.get_instance",
         return_value=_factory_with(svc),
     ):
-        fake_pg.connect.return_value = fake_conn
         wrapper.insert_tool_calls_from_output(9, 101, output)  # must not raise
 
     svc.record_invocation.assert_called_once()

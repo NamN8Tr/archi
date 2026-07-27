@@ -5568,6 +5568,18 @@ const Chat = {
         } else if (event.type === 'final') {
           const finalText = event.response || streamedText;
 
+          // A stream that never emitted 'init' still carries the real DB ids here; adopt them
+          // so feedback and switch-back address the persisted rows. A no-op after 'init'.
+          if (event.user_message_id != null && s) {
+            UI.rekeyMessage(s.userMsg.id, event.user_message_id);
+            this._adoptMessageId(s.userMsg, event.user_message_id);
+          }
+          if (event.message_id != null && s) {
+            UI.rekeyMessage(messageId, event.message_id);
+            this._adoptMessageId(s.assistantMsg, event.message_id);
+            messageId = event.message_id;
+          }
+
           // Store trace ID
           if (event.trace_id) {
             s.trace.traceId = event.trace_id;
