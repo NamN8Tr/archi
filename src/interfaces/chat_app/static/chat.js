@@ -3199,7 +3199,7 @@ const UI = {
           ${traceIconSvg}
           <span class="trace-label">${this.getTraceLabelText()}</span>
           <span class="trace-timer" data-start="${Date.now()}">0.0s</span>
-          <button class="trace-toggle" aria-label="Toggle agent activity details" title="Toggle agent activity" onclick="UI.toggleTraceExpanded('${messageId}')">
+          <button class="trace-toggle" aria-label="Toggle agent activity details" title="Toggle agent activity" onclick="UI.toggleTraceExpanded(this.closest('.trace-container').dataset.messageId)">
             <span class="toggle-icon" aria-hidden="true">&#9660;</span>
           </button>
         </div>
@@ -3699,7 +3699,7 @@ const UI = {
           ${traceIconSvg}
           <span class="trace-label">${labelText}</span>
           <span class="trace-timer">${durationStr}</span>
-          <button class="trace-toggle" aria-label="Toggle agent activity details" title="Toggle agent activity" onclick="UI.toggleTraceExpanded('${messageId}')">
+          <button class="trace-toggle" aria-label="Toggle agent activity details" title="Toggle agent activity" onclick="UI.toggleTraceExpanded(this.closest('.trace-container').dataset.messageId)">
             <span class="toggle-icon" aria-hidden="true">&#9654;</span>
           </button>
         </div>
