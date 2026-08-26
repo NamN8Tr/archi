@@ -1,3 +1,4 @@
+from src.evaluation.qa.preparation import PreparationRecord
 from src.evaluation.qa.scoring import build_summary, score_attempt
 from src.evaluation.qa.validation import Atom, Judgment
 
@@ -49,11 +50,17 @@ class TestAttemptScoring:
 
 class TestSummaryScoring:
     def test_execution_failures_count_and_evaluation_failures_are_excluded(self):
-        prepared = [
-            {
-                "item_id": "item",
-                "gold_atoms": [{"id": "g1", "text": "gold", "required": True}],
-            }
+        gold = Atom(id="g1", text="gold", required=True)
+        preparation = [
+            PreparationRecord(
+                item_id="item",
+                status="prepared",
+                question="question",
+                answer="answer",
+                time_sensitive=False,
+                gold_atoms=(gold,),
+                atom_source="inferred",
+            )
         ]
         results = [
             {
@@ -68,17 +75,19 @@ class TestSummaryScoring:
             {"item_id": "item", "status": "evaluation_failed"},
         ]
 
-        summary = build_summary([{"status": "prepared"}], prepared, results)
+        summary = build_summary(preparation, results)
 
         assert summary["item_lifecycle_counts"] == {
-            "skipped_live": 0,
+            "skipped_time_sensitive": 0,
             "preparation_failed": 0,
             "prepared": 1,
+            "skipped_live": 0,
         }
         assert summary["attempt_lifecycle_counts"] == {
             "execution_failed": 1,
             "evaluation_failed": 1,
             "scored": 1,
+            "live_validation_failed": 0,
         }
         assert summary["quality_accounted_attempts"] == 2
         assert summary["overall_attempt_pass_rate"] == 0.5

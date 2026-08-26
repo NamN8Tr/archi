@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import tempfile
+import typing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, TextIO
 
 import yaml
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -68,6 +70,27 @@ def write_bytes(path: Path, value: bytes) -> None:
             os.unlink(temp_name)
 
 
+def copy_file_atomic(source: Path, target: Path) -> None:
+    """Copy a file in bounded chunks and atomically replace the target."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", dir=str(target.parent)
+    )
+    try:
+        with (
+            os.fdopen(descriptor, "wb") as target_handle,
+            source.open("rb") as source_handle,
+        ):
+            for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                target_handle.write(chunk)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.replace(temp_name, target)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 class AtomicJsonlWriter:
     def __init__(self, path: Path):
         self.path = path
@@ -86,6 +109,41 @@ class AtomicJsonlWriter:
         if self._handle is None:
             raise RuntimeError("JSONL writer is not open")
         self._handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        commit = False
+        try:
+            if self._handle is not None and exc_type is None:
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+                commit = True
+        finally:
+            if self._handle is not None:
+                self._handle.close()
+            if self._temp_name is not None:
+                try:
+                    if commit:
+                        os.replace(self._temp_name, self.path)
+                finally:
+                    if os.path.exists(self._temp_name):
+                        os.unlink(self._temp_name)
+
+
+class AtomicTextWriter:
+    """Atomic streaming text writer for bounded artifact construction."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle: Optional[TextIO] = None
+        self._temp_name: Optional[str] = None
+
+    def __enter__(self) -> TextIO:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, self._temp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", dir=str(self.path.parent)
+        )
+        self._handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        return self._handle
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         commit = False
@@ -151,11 +209,8 @@ def artifact_hashes(run_dir: Path, names: Iterable[str]) -> Dict[str, str]:
 
 
 def verify_hashes(
-    run_dir: Path, manifest: Dict[str, Any], names: Iterable[str]
+    run_dir: Path, expected: typing.Mapping[str, str], names: Iterable[str]
 ) -> None:
-    expected = manifest.get("artifacts")
-    if not isinstance(expected, dict):
-        raise ValueError("manifest artifacts must be an object")
     for name in names:
         path = run_dir / name
         if not path.exists() or not path.is_file():
